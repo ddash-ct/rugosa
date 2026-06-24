@@ -28,11 +28,7 @@ from typing import Iterable, List, Tuple, Union, Any
 
 import dragodis
 from dragodis.interface import Function
-import yara
-from yara import *
-
-YARA_VERSION = __version__ = yara.YARA_VERSION
-YARA_VERSION_HEX = yara.YARA_VERSION_HEX
+import yara_x
 
 
 logger = logging.getLogger(__name__)
@@ -110,22 +106,21 @@ class StringMatch:
 
 class Match:
     """
-    Patches yara.Match to  convert string offsets to virtual addresses.
+    Patches yara_x.Pattern to  convert string offsets to virtual addresses.
 
     NOTE: We can't inherit yara.Match because they don't expose that class.
 
-    :param yara.Match match_object: Original match object created by YARA
+    :param yara_x.Pattern match_object: Original match object created by YARA
+    :param dragodis.Disasssembler dis: Dragodis disassembler
     :param int offset: Optional offset to offset string offsets by
-    :param bool input_offset: Whether string offsets will be the file offset
-        and should be converted.
+    :param bool file_offset: Whether string offsets will be the file offset and should be converted.
     """
 
-    def __init__(self, match_object, dis: dragodis.Disassembler, offset=None, file_offset=False, legacy_strings=False):
+    def __init__(self, match_object: yara_x.Pattern, dis: dragodis.Disassembler, offset: int = None, file_offset: bool = False):
         self._match = match_object
         self._dis = dis
         self._offset = offset
         self._file_offset = file_offset
-        self._legacy_strings = legacy_strings
         self._strings = None
 
     def __getattr__(self, item):
@@ -144,28 +139,14 @@ class Match:
 
         self._strings = []
 
-        # YARA < 4.3.0 stored strings as tuples containing (<offset>, <string identifier>, <string data>)
-        if YARA_VERSION < "4.3.0":
-            # Before returning strings, fixup the offsets to be virtual addresses.
-            self._strings = []
-            for offset, identifier, data in self._match.strings:
-                if self._offset is not None:
-                    offset += self._offset
-                if self._file_offset:
-                    offset = self._dis.get_virtual_address(offset)
-                addr = self._dis.get_line(offset).address
-                self._strings.append((addr, identifier, data))
-        else:
-            strings = [
-                StringMatch(string_match, self._dis, self._offset, self._file_offset)
-                for string_match in self._match.strings
-            ]
-            if self._legacy_strings:
-                for string_match in strings:
-                    for instance in string_match.instances:
-                        self._strings.append((instance.offset, string_match.identifier, instance.matched_data))
-            else:
-                self._strings = strings
+        for entry in self._match.matches:
+            offset = entry.offset
+            if self._offset is not None:
+                offset += self._offset
+            if self._file_offset:
+                offset = self._dis.get_virtual_address(offset)
+            addr = self._dis.get_line(offset).address
+            self._strings.append((addr, self._match.identifier, self._dis.get_bytes(addr, entry.length)))
 
         return self._strings
 
@@ -179,38 +160,13 @@ class Rules:
 
     def __init__(self, rules_object):
         self._rules = rules_object
-        self._infos = None
 
     def __getattr__(self, item):
         return getattr(self._rules, item)
 
-    def _extract_info(self):
-        """
-        Retrieve information about the rule by performing a kludgy dance with callbacks.
-        YARA should allow an easier way to give this information!
-        """
-        if self._infos is None:
-            # YARA doesn't provide any easy way to get rule info, so we are going to have
-            # to fake a match to get the info dictionary.
-            self._infos = []
-
-            def _callback(info):
-                self._infos.append(info)
-                return yara.CALLBACK_CONTINUE
-
-            self._rules.match(data=b"", callback=_callback, which_callbacks=yara.CALLBACK_NON_MATCHES)
-        return self._infos
-
-    @property
-    def names(self) -> List[str]:
-        """Returns names of all the rules contained within."""
-        infos = self._extract_info()
-        return [info["rule"] for info in infos]
-
     def match(
             self, dis: dragodis.Disassembler, *args,
             input_offset=False, offset: int = None, segment: Union[str, int] = None,
-            legacy_strings=True,
             **kwargs
     ) -> List[Match]:
         """
@@ -227,23 +183,24 @@ class Rules:
                 (<offset>, <string identifier>, <string data>) as it was presented before YARA 4.3.0.
             :param **kwargs: Keyword arguments to pass to underlying yara.match() call.
         """
-        if not legacy_strings and YARA_VERSION < "4.3.0":
-            raise ValueError(f"Turning off legacy strings is only valid for YARA < 4.3.0, got {YARA_VERSION}")
 
         # Run on segment.
         if segment:
             segment = dis.get_segment(segment)
-            kwargs["data"] = segment.data
+            data = segment.data
             offset = offset or segment.start
         # Run on input file.
         elif not (args or kwargs):
-            args = (str(dis.input_path),)
+            data = dis.input_path.read_bytes()
             input_offset = True
 
-        return [
-            Match(match, dis, offset=offset, file_offset=input_offset, legacy_strings=legacy_strings)
-            for match in self._rules.match(*args, **kwargs)
-        ]
+        matches = list()
+        for rule in self._rules.scan(data).matching_rules:
+            for pattern in rule.patterns:
+                if pattern.matches:
+                    matches.append(Match(pattern, dis, offset=offset, file_offset=input_offset))
+
+        return matches
 
     def match_strings(self, *args, **kwargs) -> List[Tuple[int, str]]:
         """
@@ -276,14 +233,9 @@ class Rules:
                     yield func
 
 
-def compile(*args, **kwargs) -> Rules:
+def compile(rule_text: str) -> Rules:
     """Wraps compiled rule in our patched Rules object."""
-    return Rules(yara.compile(*args, **kwargs))
-
-
-def load(*args, **kwargs) -> Rules:
-    """Wraps loaded rule in our patched Rules object."""
-    return Rules(yara.load(*args, **kwargs))
+    return Rules(yara_x.compile(rule_text))
 
 
 # Convenience functions ==============
@@ -291,13 +243,13 @@ def load(*args, **kwargs) -> Rules:
 
 def match(dis: dragodis.Disassembler, rule_text: str, *args, **kwargs) -> List[Match]:
     """Returns list of Match objects"""
-    rule = compile(source=rule_text)
+    rule = compile(rule_text)
     return rule.match(dis, *args, **kwargs)
 
 
 def match_strings(dis: dragodis.Disassembler, rule_text: str, *args, **kwargs) -> List[Tuple[int, str]]:
     """Returns list of (offset, string identifier)"""
-    rule = compile(source=rule_text)
+    rule = compile(rule_text)
     return rule.match_strings(dis, *args, **kwargs)
 
 
@@ -305,7 +257,7 @@ def find_functions(dis: dragodis.Disassembler, rule_text: str, *args, **kwargs) 
     """
     Iterates functions that match the given rule text.
     """
-    rule = compile(source=rule_text)
+    rule = compile(rule_text)
     yield from rule.find_functions(dis, *args, **kwargs)
 
 # ====================================
