@@ -190,7 +190,7 @@ class Rules:
             data = segment.data
             offset = offset or segment.start
         # Run on input file.
-        elif not (args or kwargs):
+        else:
             data = dis.input_path.read_bytes()
             input_offset = True
 
