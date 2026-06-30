@@ -22,7 +22,7 @@ rule MyStrings
 """
 
 # Compile a yara rule in the same way as the original yara library.
-rule = yara.compile(source=rule_text)
+rule = yara.compile(rule_text)
 
 with dragodis.open_program(r"C:\input.exe") as dis:
     matches = rule.match(dis)  # Run rule on entire disassembled code.

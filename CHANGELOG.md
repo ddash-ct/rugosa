@@ -3,10 +3,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 - Add `CMOVcc` instruction support (@ddash-ct)
-
-
-## Unreleased
 - Update the rotate carry instructions to mask the operand value (@ddash-ct)
+- Replace yara-python with yara-x (@ddash-ct)
 
 
 ## [1.3.0] - 2026-05-01
